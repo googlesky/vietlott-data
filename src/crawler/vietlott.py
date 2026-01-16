@@ -1,6 +1,7 @@
 """Vietlott data crawler and loader using HTML scraping."""
 
 import json
+import os
 import re
 from datetime import datetime
 from pathlib import Path
@@ -12,6 +13,17 @@ from bs4 import BeautifulSoup
 from loguru import logger
 
 from src.config import LotteryConfig, PRODUCTS, DATA_DIR
+
+
+UPSTREAM_BASE_URL = "https://raw.githubusercontent.com/vietvudanh/vietlott-data/main/data"
+UPSTREAM_FILES = {
+    "655": "power655.jsonl",
+    "645": "power645.jsonl",
+    "3d": "3d.jsonl",
+    "3dpro": "3d_pro.jsonl",
+    "535": "power535.jsonl",
+    "keno": "keno.jsonl",
+}
 
 
 class VietlottCrawler:
@@ -399,6 +411,105 @@ class VietlottCrawler:
         self.client.close()
 
 
+def _normalize_max3d_result(result: Any) -> list[str] | None:
+    """Flatten Max 3D/3D Pro prize dict into a list of 20 3-digit strings."""
+    if isinstance(result, list):
+        return [str(item).zfill(3) for item in result]
+
+    if not isinstance(result, dict):
+        return None
+
+    key_map = {str(k).strip().lower(): k for k in result.keys()}
+    order = ["giải đặc biệt", "giải nhất", "giải nhì", "giải ba"]
+    numbers: list[str] = []
+
+    for key in order:
+        original_key = key_map.get(key)
+        if not original_key:
+            continue
+        values = result.get(original_key) or []
+        for value in values:
+            numbers.append(str(value).zfill(3))
+
+    return numbers or None
+
+
+def _transform_upstream_record(product: str, record: dict[str, Any]) -> dict[str, Any] | None:
+    """Transform upstream record to local schema."""
+    if "date" not in record or "id" not in record:
+        return None
+
+    result = record.get("result")
+    if product in {"3d", "3dpro"}:
+        normalized = _normalize_max3d_result(result)
+        if not normalized:
+            return None
+        record = {
+            "date": record["date"],
+            "id": record["id"],
+            "result": normalized,
+            "process_time": record.get("process_time", datetime.now().isoformat()),
+        }
+        return record
+
+    if product == "535" and isinstance(result, list) and len(result) > 5:
+        result = result[:5]
+
+    record = {
+        "date": record["date"],
+        "id": record["id"],
+        "result": result,
+        "process_time": record.get("process_time", datetime.now().isoformat()),
+    }
+    return record
+
+
+def sync_from_upstream(product: str, config: LotteryConfig) -> int:
+    """Sync data from upstream GitHub dataset when direct crawling is blocked."""
+    upstream_file = UPSTREAM_FILES.get(product)
+    if not upstream_file:
+        raise ValueError(f"No upstream mapping for product: {product}")
+
+    url = f"{UPSTREAM_BASE_URL}/{upstream_file}"
+
+    existing_ids = set()
+    existing_data: list[dict[str, Any]] = []
+    if config.data_file.exists():
+        existing_df = pl.read_ndjson(config.data_file)
+        existing_ids = set(existing_df["id"].to_list())
+        existing_data = existing_df.to_dicts()
+
+    new_records: list[dict[str, Any]] = []
+    with httpx.Client(timeout=60.0, follow_redirects=True) as client:
+        with client.stream("GET", url) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if not line:
+                    continue
+                record = json.loads(line)
+                transformed = _transform_upstream_record(product, record)
+                if not transformed:
+                    continue
+                if transformed["id"] in existing_ids:
+                    continue
+                new_records.append(transformed)
+
+    if not new_records:
+        logger.info("No new records found in upstream dataset.")
+        return 0
+
+    all_data = existing_data + new_records
+    all_data.sort(key=lambda x: x["date"])
+
+    config.data_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(config.data_file, "w") as f:
+        for record in all_data:
+            f.write(json.dumps(record) + "\n")
+
+    logger.info(f"Added {len(new_records)} new records from upstream to {config.data_file}")
+    return len(new_records)
+
+
 def load_data(product: str) -> pl.DataFrame:
     """Load lottery data from local file.
 
@@ -445,6 +556,12 @@ def update_data(product: str, pages: int = 3) -> int:
     config = PRODUCTS.get(product)
     if not config:
         raise ValueError(f"Unknown product: {product}. Use '655' or '645'.")
+
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        try:
+            return sync_from_upstream(product, config)
+        except Exception as e:
+            logger.warning(f"Upstream sync failed, falling back to crawl: {e}")
 
     # Load existing IDs
     existing_ids = set()
