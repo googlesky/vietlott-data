@@ -6,9 +6,14 @@ on:
     - cron: '0 17 * * *'
   workflow_dispatch:  # Allow manual trigger
 
+permissions:
+  contents: write
+
 jobs:
   update:
     runs-on: ubuntu-latest
+    env:
+      TZ: Asia/Ho_Chi_Minh
 
     steps:
       - name: Checkout repository
@@ -31,7 +36,7 @@ jobs:
       - name: Check for changes
         id: changes
         run: |
-          if git diff --quiet data/; then
+          if [ -z "$(git status --porcelain data/)" ]; then
             echo "changed=false" >> $GITHUB_OUTPUT
           else
             echo "changed=true" >> $GITHUB_OUTPUT

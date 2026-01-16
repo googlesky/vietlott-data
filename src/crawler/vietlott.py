@@ -19,8 +19,9 @@ class VietlottCrawler:
 
     HEADERS = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Content-Type": "text/plain; charset=utf-8",
         "Accept": "*/*",
+        "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Content-Type": "text/plain; charset=utf-8",
         "Origin": "https://vietlott.vn",
         "Referer": "https://vietlott.vn/",
     }
@@ -48,6 +49,40 @@ class VietlottCrawler:
         else:
             self.endpoint = self.ENDPOINTS.get(config.sms_code, self.ENDPOINTS["645"])
         self.key = "23bbd667"  # Common key for all products
+        self._warmed_up = False
+        if self.config.result_page_url:
+            self.client.headers["Referer"] = self.config.result_page_url
+
+    def _warm_up_session(self) -> None:
+        """Prime session cookies by loading the public result page."""
+        if not self.config.result_page_url:
+            return
+
+        try:
+            self.client.get(
+                self.config.result_page_url,
+                headers={
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Referer": "https://vietlott.vn/",
+                },
+            )
+        except Exception as e:
+            logger.warning(f"Warm-up request failed: {e}")
+
+    def _fetch_latest_from_page(self) -> dict[str, Any] | None:
+        """Fetch latest draw by scraping the public result page."""
+        if not self.config.result_page_url:
+            return None
+
+        response = self.client.get(
+            self.config.result_page_url,
+            headers={
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Referer": "https://vietlott.vn/",
+            },
+        )
+        response.raise_for_status()
+        return self._parse_response(response.text)
 
     def _build_request_body(self, draw_id: str = "") -> dict[str, Any]:
         """Build request body for API call."""
@@ -256,17 +291,33 @@ class VietlottCrawler:
         Returns:
             Dict with draw data, or None if failed
         """
-        headers = dict(self.HEADERS)
+        if draw_id == "" and self.config.result_page_url:
+            try:
+                latest = self._fetch_latest_from_page()
+                if latest:
+                    return latest
+            except Exception as e:
+                logger.warning(f"Result page fetch failed, falling back to Ajax: {e}")
+
+        headers = dict(self.client.headers)
         headers["X-AjaxPro-Method"] = "ServerSideDrawResult"
+        headers["X-Requested-With"] = "XMLHttpRequest"
+        if self.config.result_page_url:
+            headers["Referer"] = self.config.result_page_url
 
         body = self._build_request_body(draw_id)
 
         try:
-            response = self.client.post(
-                self.endpoint,
-                content=json.dumps(body),
-                headers=headers,
-            )
+            response = self.client.post(self.endpoint, content=json.dumps(body), headers=headers)
+            if response.status_code == 403 and not self._warmed_up:
+                logger.warning("403 from Ajax endpoint, refreshing session and retrying")
+                self._warm_up_session()
+                self._warmed_up = True
+                response = self.client.post(
+                    self.endpoint,
+                    content=json.dumps(body),
+                    headers=headers,
+                )
             response.raise_for_status()
 
             res_json = response.json()
@@ -279,6 +330,19 @@ class VietlottCrawler:
 
             return self._parse_response(html_content)
 
+        except httpx.HTTPStatusError as e:
+            if (
+                e.response is not None
+                and e.response.status_code == 403
+                and draw_id == ""
+            ):
+                logger.warning("Ajax blocked for latest draw, falling back to result page")
+                try:
+                    return self._fetch_latest_from_page()
+                except Exception as fallback_error:
+                    logger.error(f"Fallback fetch failed: {fallback_error}")
+            logger.error(f"Failed to fetch draw {draw_id}: {e}")
+            return None
         except Exception as e:
             logger.error(f"Failed to fetch draw {draw_id}: {e}")
             return None
