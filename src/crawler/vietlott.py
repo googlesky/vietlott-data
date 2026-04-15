@@ -39,7 +39,10 @@ KETQUADIENTOAN_WEEKDAYS = {
     "3dpro": {1, 3, 5}, # Tue, Thu, Sat
 }
 KETQUADIENTOAN_LOOKBACK_DAYS = 30
-DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:149.0.2) "
+    "Gecko/20100101 Firefox/149.0.2"
+)
 
 
 class VietlottCrawler:
