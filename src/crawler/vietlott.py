@@ -3,7 +3,7 @@
 import json
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -24,13 +24,29 @@ UPSTREAM_FILES = {
     "535": "power535.jsonl",
     "keno": "keno.jsonl",
 }
+KETQUADIENTOAN_BASE_URL = "https://www.ketquadientoan.com"
+KETQUADIENTOAN_SLUGS = {
+    "655": "power-655",
+    "645": "mega-6-45",
+    "3d": "max-3d",
+    "3dpro": "max3d-pro",
+    "535": "lotto-535",
+}
+KETQUADIENTOAN_WEEKDAYS = {
+    "655": {1, 3, 5},   # Tue, Thu, Sat
+    "645": {2, 4, 6},   # Wed, Fri, Sun
+    "3d": {0, 2, 4},    # Mon, Wed, Fri
+    "3dpro": {1, 3, 5}, # Tue, Thu, Sat
+}
+KETQUADIENTOAN_LOOKBACK_DAYS = 30
+DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
 
 class VietlottCrawler:
     """Crawler for Vietlott lottery results using HTML scraping."""
 
     HEADERS = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "User-Agent": DEFAULT_USER_AGENT,
         "Accept": "*/*",
         "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
         "Content-Type": "text/plain; charset=utf-8",
@@ -473,6 +489,181 @@ def _transform_upstream_record(product: str, record: dict[str, Any]) -> dict[str
     return record
 
 
+def _extract_draw_date(text: str) -> str | None:
+    """Extract a YYYY-MM-DD date from Vietnamese page text."""
+    match = re.search(r"(\d{2}/\d{2}/\d{4})", text)
+    if not match:
+        return None
+    return datetime.strptime(match.group(1), "%d/%m/%Y").strftime("%Y-%m-%d")
+
+
+def _build_record(draw_id: str, draw_date: str, result: list[Any]) -> dict[str, Any]:
+    """Build a record in the local JSONL schema."""
+    return {
+        "date": draw_date,
+        "id": draw_id,
+        "result": result,
+        "process_time": datetime.now().isoformat(),
+    }
+
+
+def _parse_ketquadientoan_power_like_page(product: str, html_content: str) -> list[dict[str, Any]]:
+    """Parse Power 6/55, Mega 6/45, and Lotto 5/35 date pages."""
+    soup = BeautifulSoup(html_content, "lxml")
+    records: list[dict[str, Any]] = []
+
+    for block in soup.select(".box_kqxsdt"):
+        title = block.select_one(".title_tt")
+        if not title:
+            continue
+
+        title_text = title.get_text(" ", strip=True)
+        id_match = re.search(r"#(\d+)", title_text)
+        draw_date = _extract_draw_date(title_text)
+        if not id_match or not draw_date:
+            continue
+
+        numbers = [
+            int(span.get_text(strip=True))
+            for span in block.select(".box_ketqua span")
+            if span.get_text(strip=True).isdigit()
+        ]
+        if not numbers:
+            continue
+
+        if product == "645":
+            numbers = numbers[:6]
+        elif product == "655":
+            numbers = numbers[:7]
+        elif product == "535":
+            numbers = numbers[:5]
+
+        records.append(_build_record(id_match.group(1), draw_date, numbers))
+
+    return records
+
+
+def _extract_max3d_numbers(result_cell: Any) -> list[str]:
+    """Extract ordered 3-digit numbers from a Max 3D result cell."""
+    numbers: list[str] = []
+
+    for group in result_cell.select("div"):
+        digits = [span.get_text(strip=True) for span in group.select("span")]
+        if len(digits) == 3 and all(digit.isdigit() for digit in digits):
+            numbers.append("".join(digits))
+
+    return numbers
+
+
+def _parse_ketquadientoan_max3d_page(product: str, html_content: str) -> list[dict[str, Any]]:
+    """Parse Max 3D and Max 3D Pro date pages."""
+    soup = BeautifulSoup(html_content, "lxml")
+    records: list[dict[str, Any]] = []
+
+    if product == "3d":
+        wanted_labels = ("Đặc biệt", "Giải nhất", "Giải nhì", "Giải ba")
+    else:
+        wanted_labels = ("Đặc Biệt", "Nhất", "Nhì", "Ba")
+
+    for header in soup.select(".boxheader_outner_4d"):
+        header_text = header.get_text(" ", strip=True)
+        id_match = re.search(r"#(\d+)", header_text)
+        draw_date = _extract_draw_date(header_text)
+        if not id_match or not draw_date:
+            continue
+
+        box = header.find_next_sibling("div", class_="boxkqMax4d")
+        if box is None:
+            continue
+
+        table = box.select_one("table.tblMax3d")
+        if table is None:
+            continue
+
+        numbers: list[str] = []
+        for row in table.select("tr"):
+            cols = row.find_all(["td", "th"])
+            if len(cols) < 2:
+                continue
+
+            label = cols[0].get_text(" ", strip=True)
+            if any(label.startswith(wanted_label) for wanted_label in wanted_labels):
+                numbers.extend(_extract_max3d_numbers(cols[1]))
+
+        if numbers:
+            records.append(_build_record(id_match.group(1), draw_date, numbers))
+
+    return records
+
+
+def _parse_ketquadientoan_page(product: str, html_content: str) -> list[dict[str, Any]]:
+    """Parse a ketquadientoan.com result page into local records."""
+    if product in {"655", "645", "535"}:
+        return _parse_ketquadientoan_power_like_page(product, html_content)
+    if product in {"3d", "3dpro"}:
+        return _parse_ketquadientoan_max3d_page(product, html_content)
+    raise ValueError(f"Unsupported ketquadientoan product: {product}")
+
+
+def sync_from_ketquadientoan(product: str, config: LotteryConfig) -> int:
+    """Sync data from ketquadientoan.com pages when Vietlott blocks the runner."""
+    slug = KETQUADIENTOAN_SLUGS.get(product)
+    if not slug:
+        raise ValueError(f"No ketquadientoan mapping for product: {product}")
+
+    existing_ids = set()
+    existing_data: list[dict[str, Any]] = []
+    if config.data_file.exists():
+        existing_df = pl.read_ndjson(config.data_file)
+        existing_ids = set(existing_df["id"].to_list())
+        existing_data = existing_df.to_dicts()
+
+    new_records: dict[str, dict[str, Any]] = {}
+    today = datetime.now().date()
+    allowed_weekdays = KETQUADIENTOAN_WEEKDAYS.get(product)
+
+    with httpx.Client(
+        timeout=60.0,
+        follow_redirects=True,
+        headers={"User-Agent": DEFAULT_USER_AGENT},
+    ) as client:
+        for offset in range(KETQUADIENTOAN_LOOKBACK_DAYS + 1):
+            target_date = today - timedelta(days=offset)
+            if allowed_weekdays and target_date.weekday() not in allowed_weekdays:
+                continue
+
+            url = (
+                f"{KETQUADIENTOAN_BASE_URL}/ket-qua-xo-so-dien-toan-"
+                f"{slug}/{target_date.strftime('%d-%m-%Y')}.html"
+            )
+
+            response = client.get(url)
+            response.raise_for_status()
+
+            for record in _parse_ketquadientoan_page(product, response.text):
+                record_id = record["id"]
+                if record_id in existing_ids or record_id in new_records:
+                    continue
+                new_records[record_id] = record
+
+    if not new_records:
+        logger.info("No new records found in ketquadientoan.com.")
+        return 0
+
+    all_data = existing_data + list(new_records.values())
+    all_data.sort(key=lambda x: (x["date"], x["id"]))
+
+    config.data_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(config.data_file, "w") as f:
+        for record in all_data:
+            f.write(json.dumps(record) + "\n")
+
+    logger.info(
+        f"Added {len(new_records)} new records from ketquadientoan.com to {config.data_file}"
+    )
+    return len(new_records)
+
+
 def sync_from_upstream(product: str, config: LotteryConfig) -> int:
     """Sync data from upstream GitHub dataset when direct crawling is blocked."""
     upstream_file = UPSTREAM_FILES.get(product)
@@ -585,8 +776,12 @@ def update_data(product: str, pages: int = 3) -> int:
 
     if not new_data:
         if os.environ.get("GITHUB_ACTIONS") == "true" and crawler.last_fetch_failed:
-            logger.info("Live crawl failed in GitHub Actions, trying upstream mirror.")
-            return sync_from_upstream(product, config)
+            logger.info("Live crawl failed in GitHub Actions, trying ketquadientoan.com.")
+            try:
+                return sync_from_ketquadientoan(product, config)
+            except Exception as e:
+                logger.warning(f"ketquadientoan sync failed, trying upstream mirror: {e}")
+                return sync_from_upstream(product, config)
         logger.info("No new data crawled.")
         return 0
 
