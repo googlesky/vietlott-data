@@ -62,6 +62,7 @@ class VietlottCrawler:
             self.endpoint = self.ENDPOINTS.get(config.sms_code, self.ENDPOINTS["645"])
         self.key = "23bbd667"  # Common key for all products
         self._warmed_up = False
+        self.last_fetch_failed = False
         if self.config.result_page_url:
             self.client.headers["Referer"] = self.config.result_page_url
 
@@ -307,6 +308,7 @@ class VietlottCrawler:
             try:
                 latest = self._fetch_latest_from_page()
                 if latest:
+                    self.last_fetch_failed = False
                     return latest
             except Exception as e:
                 logger.warning(f"Result page fetch failed, falling back to Ajax: {e}")
@@ -337,10 +339,13 @@ class VietlottCrawler:
             # HTML is in RetExtraParam1
             html_content = res_json.get("value", {}).get("RetExtraParam1", "")
             if not html_content:
+                self.last_fetch_failed = True
                 logger.warning(f"No HTML content for draw {draw_id}")
                 return None
 
-            return self._parse_response(html_content)
+            parsed = self._parse_response(html_content)
+            self.last_fetch_failed = parsed is None
+            return parsed
 
         except httpx.HTTPStatusError as e:
             if (
@@ -350,12 +355,16 @@ class VietlottCrawler:
             ):
                 logger.warning("Ajax blocked for latest draw, falling back to result page")
                 try:
-                    return self._fetch_latest_from_page()
+                    latest = self._fetch_latest_from_page()
+                    self.last_fetch_failed = latest is None
+                    return latest
                 except Exception as fallback_error:
                     logger.error(f"Fallback fetch failed: {fallback_error}")
+            self.last_fetch_failed = True
             logger.error(f"Failed to fetch draw {draw_id}: {e}")
             return None
         except Exception as e:
+            self.last_fetch_failed = True
             logger.error(f"Failed to fetch draw {draw_id}: {e}")
             return None
 
@@ -557,12 +566,6 @@ def update_data(product: str, pages: int = 3) -> int:
     if not config:
         raise ValueError(f"Unknown product: {product}. Use '655' or '645'.")
 
-    if os.environ.get("GITHUB_ACTIONS") == "true":
-        try:
-            return sync_from_upstream(product, config)
-        except Exception as e:
-            logger.warning(f"Upstream sync failed, falling back to crawl: {e}")
-
     # Load existing IDs
     existing_ids = set()
     existing_data = []
@@ -581,6 +584,9 @@ def update_data(product: str, pages: int = 3) -> int:
         crawler.close()
 
     if not new_data:
+        if os.environ.get("GITHUB_ACTIONS") == "true" and crawler.last_fetch_failed:
+            logger.info("Live crawl failed in GitHub Actions, trying upstream mirror.")
+            return sync_from_upstream(product, config)
         logger.info("No new data crawled.")
         return 0
 
